@@ -1,0 +1,17 @@
+# IDEs and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Build and Dependency artifacts
+build/
+.gradle/
+out/
+target/
+*.class
+*.jar
+
+# Environment and Secrets
+.env
+*.log
