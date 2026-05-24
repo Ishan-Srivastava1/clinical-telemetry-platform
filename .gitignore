@@ -15,3 +15,7 @@ target/
 # Environment and Secrets
 .env
 *.log
+
+# Python virtual environments
+.venv/
+__pycache__/
