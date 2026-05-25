@@ -1,43 +1,44 @@
 plugins {
-    kotlin("jvm") version "2.0.0"
-    kotlin("plugin.serialization") version "2.0.0"
+    kotlin("jvm") version "2.0.21"
+    kotlin("plugin.serialization") version "2.0.21"
     application
-    id("com.gradleup.shadow") version "8.3.0"
+    id("com.gradleup.shadow") version "8.3.3"
 }
 
 group = "com.clinical"
 version = "1.0.0"
 
-repositories { mavenCentral() }
+repositories {
+    mavenCentral()
+}
 
 dependencies {
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.0")
-
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
     implementation("org.apache.kafka:kafka-clients:3.7.0")
     implementation("redis.clients:jedis:5.1.2")
-
-    // TimescaleDB / Postgres
     implementation("org.postgresql:postgresql:42.7.3")
     implementation("com.zaxxer:HikariCP:5.1.0")
-
-    // Metrics
     implementation("io.prometheus:simpleclient:0.16.0")
     implementation("io.prometheus:simpleclient_common:0.16.0")
     implementation("io.prometheus:simpleclient_hotspot:0.16.0")
-
-    // Logging
     implementation("ch.qos.logback:logback-classic:1.5.6")
 }
 
 application {
+    // Gradle 8 / modern best practice: use mainClass, NOT the deprecated mainClassName.
     mainClass.set("com.clinical.telemetry.worker.MainKt")
 }
 
-kotlin { jvmToolchain(21) }
+kotlin {
+    jvmToolchain(21)
+}
 
-tasks.named<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("shadowJar") {
+// com.gradleup.shadow 8.3.3 reads `application.mainClass` automatically,
+// so no manual Main-Class manifest line is needed.
+tasks.shadowJar {
     archiveBaseName.set("telemetry-worker")
     archiveClassifier.set("all")
+    archiveVersion.set("")
     mergeServiceFiles()
 }

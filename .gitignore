@@ -10,12 +10,27 @@ build/
 out/
 target/
 *.class
+
+# Keep the Gradle wrapper jar! (Crucial for CI/CD and cloning)
+!gradle/wrapper/gradle-wrapper.jar
+
+# Ignore other jars unless explicitly needed
 *.jar
 
 # Environment and Secrets
 .env
 *.log
 
-# Python virtual environments
+# Python virtual environments & compiled files
 .venv/
 __pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Local Database & Docker Volumes (Prevents uploading gigabytes of Timescale/Kafka data)
+data/
+volumes/
+pgdata/
+redisdata/
+kafka_data/

@@ -12,6 +12,7 @@ import redis.clients.jedis.JedisPool
 import java.time.Duration
 import java.util.Properties
 import java.util.concurrent.atomic.AtomicBoolean
+import com.clinical.telemetry.worker.WorkerMetrics
 
 class Worker(
     private val kafkaBootstrap: String,
