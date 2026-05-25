@@ -1,0 +1,172 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "schemaVersion": 39,
+  "tags": ["clinical", "telemetry"],
+  "time": { "from": "now-15m", "to": "now" },
+  "refresh": "5s",
+  "title": "Clinical Telemetry & Patient Risk Platform",
+  "uid": "clinical-telemetry",
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Ingest throughput (events/sec)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "lineWidth": 2, "fillOpacity": 15, "stacking": { "mode": "normal" } } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right" } },
+      "targets": [
+        {
+          "expr": "sum by (metric) (rate(telemetry_events_ingested_total[1m]))",
+          "legendFormat": "{{metric}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "/ingest latency p50/p95/p99 (s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(telemetry_ingest_latency_seconds_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(telemetry_ingest_latency_seconds_bucket[5m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(telemetry_ingest_latency_seconds_bucket[5m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Artifact suppression ratio",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 8, "w": 6, "h": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.05 },
+              { "color": "red", "value": 0.15 }
+            ]
+          }
+        }
+      },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        {
+          "expr": "sum(rate(worker_events_flagged_total[5m])) / (sum(rate(worker_events_flagged_total[5m])) + sum(rate(worker_events_passed_total[5m])))",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Flagged events per minute (per metric)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 6, "y": 8, "w": 12, "h": 6 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        {
+          "expr": "60 * sum by (metric) (rate(worker_events_flagged_total[1m]))",
+          "legendFormat": "{{metric}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Redis Lua p99 (s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 18, "y": 8, "w": 6, "h": 6 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(worker_lua_latency_seconds_bucket[5m])))",
+          "legendFormat": "p99",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "TimescaleDB write throughput (rows/sec)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 14, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "rps" } },
+      "targets": [
+        {
+          "expr": "sum(rate(worker_rows_written_total[1m]))",
+          "legendFormat": "rows/sec",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "TimescaleDB batch latency p99 (s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 12, "y": 14, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(worker_pg_batch_latency_seconds_bucket[5m])))",
+          "legendFormat": "p99",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "End-to-end pipeline gap (ingest − written − flagged)",
+      "description": "Healthy when ~0. Positive = consumer lag, negative = metric bug.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 22, "w": 24, "h": 6 },
+      "fieldConfig": { "defaults": { "unit": "ops" } },
+      "targets": [
+        {
+          "expr": "sum(rate(telemetry_events_ingested_total[1m])) - sum(rate(worker_rows_written_total[1m])) - sum(rate(worker_events_flagged_total[1m]))",
+          "legendFormat": "gap (should be ~0)",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Live vitals (TimescaleDB, last 5 min, patient P0000)",
+      "datasource": { "type": "postgres", "uid": "timescaledb" },
+      "gridPos": { "x": 0, "y": 28, "w": 24, "h": 10 },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT time AS \"time\", metric AS metric, value FROM telemetry WHERE patient_id = 'P0000' AND $__timeFilter(time) ORDER BY 1"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+
+  - name: TimescaleDB
+    uid: timescaledb
+    type: postgres
+    access: proxy
+    url: timescaledb:5432
+    database: clinical
+    user: grafana_ro
+    secureJsonData:
+      password: grafana_ro_pw
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: true
+    editable: true
