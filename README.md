@@ -1,8 +1,8 @@
 # Clinical Telemetry & Patient Risk Platform
 
-A real-time data pipeline that takes ICU bedside-monitor readings — heart rate, blood-oxygen, breathing rate — runs every single reading through a machine-learning model to figure out whether it's real or sensor noise, then stores it in a time-series database that powers a live clinical dashboard.
+A real-time data pipeline for ICU vital-sign monitoring. The system ingests continuous bedside-monitor readings (heart rate, blood-oxygen saturation, respiratory rate), uses an unsupervised machine-learning model to distinguish real readings from sensor glitches, persists everything to a time-series database, and exposes live visibility into the pipeline and the model via Grafana.
 
-100 simulated patients. 1,500 events per second. 1 ML model per vital sign. Sub-50-millisecond end-to-end latency. Zero data loss.
+**At a glance:** 100 simulated patients, ~1,500 events/sec sustained throughput, sub-50 ms end-to-end latency, no data loss.
 
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.0-7F52FF?logo=kotlin&logoColor=white)
 ![Ktor](https://img.shields.io/badge/Ktor-2.3-087CFA?logo=ktor&logoColor=white)
@@ -17,310 +17,438 @@ A real-time data pipeline that takes ICU bedside-monitor readings — heart rate
 ![Docker](https://img.shields.io/badge/Docker%20Compose-2496ED?logo=docker&logoColor=white)
 ![Gradle](https://img.shields.io/badge/Gradle-8.10-02303A?logo=gradle&logoColor=white)
 
----
+## Background
 
-## Table of Contents
+A modern intensive-care unit produces continuous data from every bedside monitor. Heart rate, blood-oxygen saturation (SpO₂), and respiratory rate are sampled several times per second per patient. A 30-bed unit can generate hundreds of thousands of measurements per minute.
 
-- [The Problem This Solves](#the-problem-this-solves)
-- [How It Works (in plain English)](#how-it-works-in-plain-english)
-- [Architecture](#architecture)
-- [Walking Through the Data, Step by Step](#walking-through-the-data-step-by-step)
-- [The ML Part — Why an IsolationForest?](#the-ml-part--why-an-isolationforest)
-- [The Dashboard, Panel by Panel](#the-dashboard-panel-by-panel)
-- [Tech Stack — and Why Each Piece Is There](#tech-stack--and-why-each-piece-is-there)
-- [Performance Numbers](#performance-numbers)
-- [Running It Yourself](#running-it-yourself)
-- [Project Structure](#project-structure)
-- [Engineering Decisions Worth Calling Out](#engineering-decisions-worth-calling-out)
-- [Where I'd Take It Next](#where-id-take-it-next)
-- [License](#license)
+Two problems shape the design of any system that handles this data:
 
----
+1. **Throughput and storage.** Generic relational databases degrade under sustained high-frequency inserts that compete with dashboard queries on the same table. A time-series database with time-based partitioning, compression, and pre-computed rollups is required.
 
-## The Problem This Solves
+2. **Sensor noise.** Bedside monitors produce frequent false readings: probes slip, cables disconnect, leads pick up electrical interference. Each glitch is a single impossible value. If those reach clinicians as alarms, the false-positive rate becomes so high that real alarms are routinely ignored. This is called alarm fatigue, and it is a documented patient-safety problem. Sensor artifacts must be filtered before they become alarms, by a system whose behavior is observable and tunable.
 
-Walk into a modern intensive-care unit and listen for a minute. You'll hear alarms. A *lot* of alarms. Bedside monitors beep when a heart rate dips below a threshold, when blood-oxygen drops, when breathing slows. Each beep is supposed to mean something. In practice, somewhere between 80% and 99% of them are false — they fire because a probe slipped, a cable wiggled, the patient rolled over, or a static shock hit the lead. The clinical research is brutal on this: it's called **alarm fatigue**, and it's a documented patient-safety problem. Nurses literally stop hearing the alarms after a while, because the signal-to-noise ratio is awful.
+This project addresses both problems through a four-stage pipeline that prioritizes throughput, observability, and explicit failure handling at every layer.
 
-That's the problem. Now consider the data underneath it. A 30-bed ICU produces hundreds of thousands of vital-sign measurements every minute. Each one needs to be (1) ingested without dropping anything, (2) judged as real or noise *fast enough that the judgment is still useful*, and (3) stored in a way that lets a clinician scroll back through hours of a patient's history and have it render instantly. A regular Postgres table getting hammered with high-frequency inserts while a dashboard queries the same rows will fall over in minutes.
+## Architecture Overview
 
-So this project is a working prototype of the data layer that sits underneath that kind of system. It does three things at once:
+The pipeline consists of 4 stages connected by Kafka topics, plus an observability layer scraped from all three application services:
 
-1. Takes vitals in over HTTP and never loses one.
-2. Runs every reading through a machine-learning model that learns what "normal" looks like and flags the obvious sensor glitches **before** they ever become an alarm.
-3. Stores everything in a time-series database tuned for clinical dashboards, with full observability on the pipeline *and* the model.
+- **Stage 1: Ingest.** A Kotlin/Ktor HTTP service receives readings and produces them to the Kafka topic `telemetry.raw` with strict durability settings.
+- **Stage 2: ML scoring.** A Python service consumes `telemetry.raw`, scores each reading with a per-metric IsolationForest, and republishes the result to `telemetry.scored`.
+- **Stage 3: Persistence.** A Kotlin worker consumes `telemetry.scored` and batch-writes every event (clean and flagged) to TimescaleDB via PostgreSQL `COPY`.
+- **Stage 4: Observability.** Prometheus scrapes each service every 5 seconds. Grafana renders four rows of dashboard panels backed by both Prometheus (pipeline metrics) and TimescaleDB (clinical data).
 
-The whole thing runs on a laptop. One `docker compose up` and you've got the infrastructure. Four terminals and you've got the live pipeline.
+Infrastructure (Kafka, TimescaleDB, Prometheus, Grafana) runs in Docker via Docker Compose. The three application services (ingest, ML detector, worker) run on the host for fast iteration.
 
----
-
-## How It Works (in plain English)
-
-Imagine a small assembly line:
-
-1. **The patients.** A Python script pretends to be 100 ICU patients, each one quietly generating heart rate / SpO₂ / breathing-rate readings five times a second. Sometimes a "patient" silently starts to deteriorate (their heart rate creeps up over 30 seconds, breathing speeds up). Sometimes a "monitor" glitches and spits out a single nonsense reading. Both happen in real ICUs, and a good pipeline has to tell them apart.
-
-2. **The front door.** A small Kotlin web service catches every reading over HTTP. It's built on Ktor + Netty, which means it can hold thousands of concurrent connections without breaking a sweat. Every reading is shoved into Kafka with strict durability settings — `acks=all`, idempotent producer, infinite retries. If a single byte ever gets dropped, that's a bug.
-
-3. **The brain.** A Python service is sitting on the other side of Kafka, eating every reading as it arrives. For each one, it asks an `IsolationForest` model (a type of unsupervised anomaly detector from scikit-learn): "is this normal, or is this nonsense?" It tags the reading with the answer and shoves it back into Kafka on a different topic.
-
-4. **The vault.** A Kotlin worker reads the tagged stream and bulk-writes every reading into TimescaleDB — both the clean ones and the ones the model flagged. We *don't throw the flagged ones away*, because we want the dashboard to be able to show them as red dots on top of a patient's vitals chart later.
-
-5. **The dashboard.** Grafana sits on top of all of it, with two data sources: Prometheus (for "how is the pipeline doing?") and TimescaleDB (for "what's happening with patient P0083 right now?"). Four rows of panels, each answering a different question.
-
-That's the whole system. The rest of this README is the long version of those five paragraphs.
-
----
-
-## Architecture
+## Data Flow
 
 ```
-┌─────────────────────┐         ┌─────────────────────┐         ┌──────────────────────┐
-│  Python Generator   │  HTTP   │  Ktor Ingest        │  Kafka  │  Python ML Detector  │
-│  100 patient sims   │ ───────▶│  /ingest (Netty)    │ ───────▶│  IsolationForest x3  │
-│  async aiohttp      │         │  Coroutine producer │  raw    │  (HR / SPO2 / RR)    │
-└─────────────────────┘         └──────────┬──────────┘         └──────────┬───────────┘
-                                           │                                │
-                                           ▼                                │ Kafka
-                                  ┌────────────────┐                        │ scored
-                                  │  Prometheus    │                        ▼
-                                  │  scrapes all 3 │              ┌──────────────────────┐
-                                  │  services      │              │  Kotlin Worker       │
-                                  └────────┬───────┘              │  Consumer + COPY     │
-                                           │                      └──────────┬───────────┘
-                                           ▼                                 ▼
-                                  ┌────────────────┐              ┌──────────────────┐
-                                  │   Grafana      │◀─────────────│  TimescaleDB     │
-                                  │   dashboards   │   SQL panels │  hypertable      │
-                                  └────────────────┘              └──────────────────┘
+Simulated Patient (HR / SpO2 / RR sample)
+  → [Ingest]        HTTP POST /ingest, Kafka producer with acks=all
+  → [Kafka raw]     telemetry.raw, 16 partitions, keyed by patientId
+  → [ML Detector]   IsolationForest feature extraction + predict
+  → [Kafka scored]  telemetry.scored with flagged, anomalyScore, reason
+  → [Worker]        Batched COPY into TimescaleDB
+  → [TimescaleDB]   Hypertable partitioned by time + patient_id
+  → [Grafana]       Live dashboards (PromQL + raw SQL)
 ```
 
-Kafka, TimescaleDB, Prometheus, and Grafana are all in Docker. The three "code" services — the Kotlin ingest, the Python ML detector, the Kotlin worker — run on the host so you can edit-build-rerun them without container churn. Prometheus reaches them through `host.docker.internal`.
+## Glossary
 
----
+Brief definitions for terms used throughout this document.
 
-## Walking Through the Data, Step by Step
+- **Kafka:** A distributed log that holds messages in order. Producers append messages; consumers read them. Used here to decouple services and provide durability.
+- **Topic / Partition:** A topic is a named stream of messages in Kafka. A topic is split into partitions, each holding an ordered subsequence of the messages. Partitioning enables parallel consumption.
+- **TimescaleDB:** PostgreSQL with an extension for time-series workloads. Adds automatic time-based partitioning and columnar compression on top of standard PostgreSQL.
+- **Hypertable:** TimescaleDB's term for a logical table that is internally partitioned into many smaller physical tables (called chunks) based on a time column.
+- **IsolationForest:** An unsupervised anomaly-detection algorithm from scikit-learn. It identifies points that are statistically uncommon without requiring labeled training data.
+- **Unsupervised model:** A model trained without labeled examples. The model learns the structure of the data and identifies outliers, rather than being told in advance what is "normal" or "anomalous."
+- **Prometheus:** A metrics database that periodically pulls numerical measurements from running services and stores them.
+- **Grafana:** A visualization tool that renders dashboards on top of data sources such as Prometheus or PostgreSQL.
+- **Ktor:** A Kotlin framework for building asynchronous HTTP services.
+- **Coroutine:** A unit of work that can pause and resume without blocking a thread, allowing a small number of OS threads to handle thousands of in-flight operations.
+- **HikariCP:** A JDBC connection pool. Manages a fixed set of database connections shared by application code.
+- **COPY:** A PostgreSQL protocol command that streams a tab-separated block of rows directly into a table. Significantly faster than per-row `INSERT` for large batches.
 
-### 1. The simulator — `generator/simulate.py`
+## Stage-by-Stage Architecture
 
-Spawns 100 async Python coroutines, one per simulated patient. Each one keeps its own state — its baseline heart rate, baseline SpO₂, baseline breathing rate, and whether it's currently in a deterioration episode. Five times a second it generates three readings (HR, SpO₂, RR) and POSTs them to the ingest API.
+### Stage 1: Ingest
 
-Two things make the simulator more than a toy:
+**Purpose:** Accept incoming readings over HTTP, validate them, and produce them to Kafka with durability guarantees.
 
-- **Autoregressive vitals.** The numbers don't jump randomly; they mean-revert toward each patient's personal baseline with small Gaussian noise. That looks like a real ECG strip, not a uniform-random number generator.
-- **Two failure modes.** Each patient occasionally enters a sustained deterioration (slow drift toward unhealthy values), and independently occasionally emits a brief sensor artifact (one rogue sample, then back to normal). The ML model downstream is supposed to flag the artifacts and *not* flag the deterioration. Without both modes, you can't honestly evaluate it.
+**Key Features:**
 
-### 2. The ingest — `ingest/` (Kotlin + Ktor)
+- **Non-blocking I/O:** Each HTTP request is handled by a Kotlin coroutine running on Netty. The service supports thousands of concurrent connections on a small number of OS threads.
+- **Durable producer configuration:** `acks=all` ensures every message is acknowledged by all in-sync replicas. `enable.idempotence=true` deduplicates retried sends. Retries are unbounded on transient failures.
+- **Partition routing by patient ID:** The `patientId` field is used as the Kafka message key. Messages with the same key always go to the same partition, preserving per-patient ordering across both Kafka hops while allowing horizontal consumer parallelism.
+- **Producer-side batching:** A 5 ms linger window coalesces messages into larger Kafka requests. `zstd` compression reduces network and disk footprint.
+- **Prometheus instrumentation:** Counters and histograms expose per-metric throughput and end-to-end ingest latency.
 
-A small HTTP service that does one thing: accept a `POST /ingest` and immediately put the payload onto a Kafka topic called `telemetry.raw`. The catch is doing that for ~1,500 requests/sec on a single laptop without dropping anything.
+**Output:** Messages on `telemetry.raw` with payload `{patientId, metric, value, timestamp, deviceId}`.
 
-A few decisions that make this fast and safe:
+### Stage 2: Kafka (transport and buffer)
 
-- **Netty engine, coroutines.** Every incoming request is a suspending Kotlin coroutine, not an OS thread. The JVM holds thousands of in-flight requests with a tiny resident set.
-- **Patient ID as the Kafka key.** This is more important than it sounds. Kafka uses the message key to decide which partition a record goes to. By keying on `patientId`, *all* events for the same patient end up on the same partition — which means a downstream consumer sees them in order. You can scale out consumers across patients while preserving order *within* a patient.
-- **Durability over speed.** `acks=all` + `enable.idempotence=true` + infinite retries. If Kafka momentarily loses a broker, the producer waits and retries. We never lie about whether a reading was accepted.
+**Purpose:** Decouple every stage of the pipeline and provide durable buffering.
 
-### 3. Kafka
+**Key Features:**
 
-Kafka here is doing two jobs: it's the durability layer (every reading is on disk before the ingest acks the HTTP request), and it's the **shock absorber** between every two services. If the ML detector is slow for a few seconds while it refits a model, Kafka quietly buffers everything in its log. The ingest never blocks. When the detector catches up, it does so without anyone noticing. Same trick between the detector and the worker.
+- **KRaft mode:** Single-broker setup without ZooKeeper. 16 partitions each on `telemetry.raw` and `telemetry.scored`.
+- **Durability:** Every reading is written to the Kafka log on disk before the ingest service returns HTTP 200 to the client.
+- **Backpressure absorption:** If the ML detector or the worker slows down, Kafka holds the backlog in its log. Upstream stages are not blocked by a slow downstream consumer.
+- **24-hour retention** for local development. Configurable via `KAFKA_LOG_RETENTION_HOURS` in `docker-compose.yml`.
 
-Running in **KRaft mode** — no ZooKeeper. One broker, 16 partitions each on `telemetry.raw` and `telemetry.scored`.
+### Stage 3: ML Detector
 
-### 4. The ML detector — `ml-detector/detector.py` (Python)
+**Purpose:** Classify every reading as either a sensor artifact (flagged) or a clean signal (passed through), in real time, without labeled training data.
 
-This is the most interesting service in the project, so it has its own section below ([The ML Part](#the-ml-part--why-an-isolationforest)). The short version: it consumes `telemetry.raw`, runs each reading through an IsolationForest, and republishes the same reading with three extra fields — `flagged`, `anomalyScore`, `reason` — to `telemetry.scored`.
+**Key Features:**
 
-### 5. The worker — `worker/` (Kotlin)
+- **Pre-trained model:** `scikit-learn` `IsolationForest`, one model per metric (HR, SpO₂, RR), pooled across all patients during training.
+- **5-D feature vector per sample:** raw value, single-sample jump magnitude, local z-score against a 30-second window, local standard deviation, and distance from the population baseline.
+- **Rolling history (per patient, per metric):** A deque of the most recent 150 samples used only for feature extraction, not for training.
+- **Warmup and refit:** Each model becomes active after seeing 1,000 events for its metric (approximately 7 seconds at full throughput). Each model refits every 5,000 events on the most recent 1,000 feature vectors.
+- **Confidence calibration:** Anomaly scores are sign-flipped from `decision_function` output so that larger values indicate higher anomaly.
+- **Full Prometheus surface:** Per-metric throughput counters, flagged counters, prediction-latency histograms, anomaly-score distribution histograms, model-ready gauges, refit counters, and training-buffer-size gauges.
 
-Reads `telemetry.scored` off Kafka in batches, then bulk-inserts everything into TimescaleDB using PostgreSQL's `COPY ... FROM STDIN` protocol. COPY is roughly 8–10× faster than batched INSERTs for batches over a thousand rows, because it streams a tab-separated buffer through a single socket connection instead of round-tripping per row.
+**Output:** Messages on `telemetry.scored` with the original payload plus three new fields: `flagged: bool`, `anomalyScore: float`, `reason: string`.
 
-The worker writes **every event, flagged or not**, into the same table. The `flagged` column distinguishes them. That single design choice is what makes the "live patient overlay with red dots" panel possible later — you can't render anomaly markers if you've thrown the anomalies away.
+**Example:**
 
-It's also been hardened against silent hangs: the JDBC connection has an explicit `socketTimeout=30s` and TCP keep-alive on, HikariCP has leak detection, and the Kafka consumer config sets `max.poll.interval.ms=180s` so a slow batch doesn't get the worker kicked out of the consumer group. There's a `logback.xml` so every batch + every retry shows up in stdout with a timestamp.
+```python
+from detector import extract_features, fit_model
 
-### 6. The database — TimescaleDB
+features = extract_features(value=205.3, metric="HR", state=patient_state)
+# Returns: np.array([205.3, 87.4, 6.81, 5.2, 5.21])
 
-TimescaleDB is regular PostgreSQL with an extension that turns a table into a **hypertable** — a logical table backed by many physical "chunks" partitioned by time. The schema here uses 1-day chunks on time AND 8 space partitions on `patient_id`, so a dashboard query for "give me P0083's last 5 minutes" hits exactly one tiny chunk instead of fanning out across a giant table.
+prediction = model.predict(features.reshape(1, -1))[0]
+score = -model.decision_function(features.reshape(1, -1))[0]
+# Returns: -1 (anomaly), score=0.34
+```
 
-Three TimescaleDB features pull their weight:
+### Stage 4: Worker (Persistence)
 
-- **Hypertables** — transparent partitioning. The application writes to one logical table; TimescaleDB routes inserts to the right chunk.
-- **Native columnar compression** — kicks in on chunks older than 1 hour. Compressed chunks are 10–20× smaller and faster for aggregate queries.
-- **Continuous aggregates** — a 1-minute rollup (`telemetry_1min`) is pre-computed in the background, so dashboards that want "average HR per minute over the last 4 hours" hit a tiny materialized view instead of millions of raw rows.
+**Purpose:** Consume scored events from Kafka and batch-write them into TimescaleDB.
 
-### 7. The observability layer — Prometheus + Grafana
+**Key Features:**
 
-Every code service exposes `/metrics` in Prometheus exposition format. Prometheus scrapes them every 5 seconds. Grafana renders the panels you'll see below — four rows of them, each answering a different question about a different layer of the stack.
+- **Batched COPY writes:** Up to 1,000 rows per batch streamed via `COPY ... FROM STDIN WITH (FORMAT text)`. Approximately 8 to 10 times faster than batched `INSERT` for batches this size.
+- **All events persisted:** Both `flagged=TRUE` and `flagged=FALSE` rows are written. Distinguishing them is the responsibility of the schema (`flagged` column), not the worker. This is required by the anomaly-marker overlay panel.
+- **JDBC timeouts:** `socketTimeout=30s` and `tcpKeepAlive=true` prevent indefinite blocking on a half-broken database connection.
+- **HikariCP hardening:** `leakDetectionThreshold=60s`, `keepaliveTime=30s`, and `validationTimeout=3s`.
+- **Retry logic:** Each COPY batch is retried up to 3 times with exponential backoff before being reported as a permanent failure.
+- **No commit on failure:** If a batch fails permanently, the worker does not commit the Kafka offset. Kafka redelivers the batch on the next poll, eliminating silent data loss.
+- **Structured logging:** A configured `logback.xml` ensures every batch, retry, and failure is visible in stdout with a timestamp.
 
----
+**Output:** Rows in the `telemetry` hypertable with columns `time, patient_id, metric, value, device_id, z_score, window_mean, window_std, flagged, reason`.
 
-## The ML Part — Why an IsolationForest?
+### Stage 5: TimescaleDB
 
-This is the heart of the project, so it's worth a few paragraphs.
+**Purpose:** Store time-series telemetry data in a way that supports both sustained high-frequency writes and fast clinical dashboard queries.
 
-### The clinical problem, restated
+**Key Features:**
 
-A single weird reading from a bedside monitor could be:
+- **Hypertable partitioned by time and patient ID:** 1-day chunks on the `time` column with 8 space partitions on `patient_id`. Per-patient dashboard queries hit a single chunk instead of scanning the full table.
+- **Native columnar compression:** Applied automatically to chunks older than 1 hour via `add_compression_policy`. Compressed chunks use roughly 10 to 20 times less storage and serve aggregate queries faster.
+- **Compression segment-by:** Compressed chunks group rows by `(patient_id, metric)`, matching the dimensions clinical queries scan along.
+- **Continuous aggregates:** A materialized view (`telemetry_1min`) pre-computes 1-minute rollups of average, min, and max per `(patient_id, metric)`. Dashboards querying long time ranges hit the rollup instead of raw rows.
+- **Partial index on flagged rows:** `idx_tel_flagged_patient_time WHERE flagged = TRUE` accelerates anomaly-marker queries directly.
+- **Read-only role:** A separate `grafana_ro` role with `SELECT` on `public.*` and `_timescaledb_internal.*`. `ALTER DEFAULT PRIVILEGES` ensures new chunks are auto-granted.
 
-- A real cardiac event (deteriorating patient — must catch).
-- A sensor artifact (probe slipped — must ignore).
+**Output:** Persistent storage of all telemetry plus pre-computed aggregates for dashboards.
 
-At a *single sample's resolution*, those two things can look indistinguishable. Both are big, sudden departures from a patient's baseline. A naive "alert if it's far from normal" rule fires on both — and that's how you get the alarm-fatigue problem at the top of this README.
+### Stage 6: Observability (Prometheus + Grafana)
 
-The previous version of this project tried to solve it with a Redis-Lua script computing a 30-second rolling z-score per patient. It was clever, it was fast, and it was *static*. It couldn't learn. So I replaced it with an actual ML model — and the model gets its own service, with its own Kafka topics, so it can be swapped out without touching the ingest or the storage.
+**Purpose:** Expose pipeline health and ML model behavior in real time.
 
-### Why specifically IsolationForest?
+**Key Features:**
 
-`IsolationForest` is an unsupervised tree-ensemble algorithm. Three reasons it fits this problem:
+- **Pull-based scraping:** Prometheus pulls `/metrics` from each application service every 5 seconds.
+- **Three exposition endpoints:** Ingest on port 8080, ML detector on port 9200, Worker on port 9100.
+- **Two data sources in Grafana:** Prometheus (for pipeline counters/histograms) and TimescaleDB (for clinical SQL panels). Both used in the same dashboard.
+- **Provisioning as code:** Datasource definitions, dashboard providers, and full dashboard JSON are versioned in the repository. A clean `docker compose up -d` reproduces the entire observability layer.
 
-1. **It's unsupervised.** I don't have labeled "artifact" vs "real" data. Nobody hand-annotated millions of ICU samples for me. IsolationForest doesn't need labels — it learns what the bulk of the data looks like and flags anything that's "easy to isolate" (i.e., few decision-tree splits needed to separate it from the crowd).
-2. **It's fast at inference.** `model.predict()` on a single 5-D feature vector returns in roughly 50 microseconds on a laptop CPU. The whole detector loop including feature extraction sits at ~1 ms p99. That's fast enough that the ML doesn't even register on the end-to-end latency chart.
-3. **It has one knob.** The `contamination` parameter says "what fraction of inputs do you expect to be anomalous?" That's a number a model owner and a clinician can actually have a conversation about. It's not a black box.
+**Output:** Live dashboards rendered at http://localhost:3000.
 
-### How it actually works in this codebase
+## ML Detector Deep Dive
 
-The detector keeps a small rolling window of the last 150 samples (~30 seconds at 5 Hz) for each `(patient_id, metric)` pair. **That window is used only for feature extraction, not for training.** For every new reading, it builds a 5-dimensional feature vector describing the reading's relationship to the patient's own recent history:
+### Why Unsupervised
 
-1. The raw value itself.
-2. `|value - previous_value|` — how big a single-sample jump.
-3. The z-score against the local 30-second window.
-4. The local 30-second standard deviation — how stable is this patient right now.
-5. Distance from the global population baseline (`|value - pop_mean| / pop_stddev`).
+Labeled artifact data does not exist at the required scale. Hand-labeling millions of ICU samples as "real" versus "glitch" is infeasible. An unsupervised algorithm learns the structure of normal data and identifies outliers without ground-truth labels.
 
-Those 5-D vectors get pooled across **all 100 patients** for training. There's one IsolationForest per metric — HR, SpO₂, RR — three models total. Each one warms up after it's seen 1,000 events for its metric (about ~7 seconds at our throughput), then refits every 5,000 events to adapt to slow drift in the population.
+### Why IsolationForest Specifically
 
-Pooling across patients is important: it means a brand-new patient gets meaningful predictions from minute one, because the model was trained on what "normal" looks like across the population. A truly per-patient model would have to warm up separately for each patient, which is unworkable.
+Three properties make IsolationForest a good fit for this problem:
 
-### Tuning `contamination` for clinical use
+1. **Fast inference.** A single prediction takes approximately 50 microseconds. The full feature-extraction-and-predict loop runs at ~1 ms p99, which does not register on the end-to-end latency budget.
+2. **One tunable parameter with a clinical interpretation.** `contamination` represents the expected fraction of true anomalies in the input. This is a quantity a clinician and a model owner can discuss directly. It is not a black-box neural-net hyperparameter.
+3. **No specialized infrastructure.** Trains on CPU in seconds. Requires no GPU, no model registry, no external inference server. Deployable as a regular Python service.
 
-`contamination` sets the decision threshold. For ICU vitals, the right range is 1–5%, and the direction you err matters a lot:
+### Feature Engineering
+
+For each `(patient_id, metric)` pair, the detector maintains a rolling deque of the most recent 150 samples (approximately 30 seconds at 5 Hz). This window is used only for feature extraction, not for training.
+
+For every incoming sample, a 5-dimensional feature vector is computed:
+
+1. **Raw value:** the reading itself.
+2. **Single-sample jump magnitude:** absolute difference from the patient's previous value.
+3. **Local z-score:** number of standard deviations the new value sits from the local 30-second window mean.
+4. **Local standard deviation:** how variable the patient's recent readings have been.
+5. **Distance from population baseline:** absolute distance from the metric's expected population mean, normalized by the expected deviation.
+
+### Training Strategy
+
+Feature vectors are pooled across all 100 patients. One IsolationForest is trained per metric, for three models total.
+
+- **Warmup:** Each model becomes active after `MIN_FIT_SAMPLES=1000` events for its metric have been observed (approximately 7 seconds at full throughput). Until warmup completes, the verdict for that metric is `"warmup"`.
+- **Refit:** Each model refits every `REFIT_INTERVAL=5000` events on the most recent 1,000 feature vectors. This adapts the model to slow drift in the population distribution.
+- **Default contamination:** `0.03`, matching the simulator's injected artifact rate.
+
+Pooling features across patients is intentional. A model trained on the population sees enough variation to make meaningful predictions on any patient, including new arrivals, immediately. Per-patient models would require independent warmup per patient, which is impractical.
+
+### Tuning `contamination`
+
+`contamination` is the expected fraction of true anomalies in the input. IsolationForest uses it to set its decision threshold.
 
 | Setting | Effect | Clinical risk |
 |---|---|---|
-| **Too high** (e.g. 0.10) | Aggressive; many normal readings flagged | **Dangerous.** False negatives can kill people. |
-| **Too low** (e.g. 0.005) | Conservative; only extreme outliers caught | Manageable — some artifacts slip through, but downstream rate-limiting catches them. |
-| **0.03** (default here) | Matches the artifact rate the simulator injects | Reasonable starting point |
+| Too high (e.g. 0.10) | Many normal samples flagged | High. False negatives are harmful in clinical contexts. |
+| Too low (e.g. 0.005) | Only extreme outliers flagged | Lower. Residual artifacts are caught by downstream rate-limiting. |
+| 0.03 (current default) | Matches simulator artifact rate | Reasonable default. |
 
-In medicine, false negatives are worse than false positives. A noisy alarm has a human in the loop who can ignore it. A *missed* alarm has no second chance. So when in doubt — err toward letting more readings through, not filtering more out.
+In clinical settings, false negatives (missed real events) are worse than false positives (extra alarms). Tuning should err toward letting samples through.
 
-### Observability, on the model itself
+### Model Observability Metrics
 
-This is the part most "we have ML in production" stories skip. The detector exposes a full Prometheus surface:
+| Metric | Type | Purpose |
+|---|---|---|
+| `ml_detector_events_scored_total{metric}` | Counter | Per-metric throughput |
+| `ml_detector_events_flagged_total{metric}` | Counter | Per-metric anomaly count |
+| `ml_detector_prediction_latency_seconds` | Histogram | Latency of feature extraction + predict |
+| `ml_detector_anomaly_score` | Histogram | Distribution of live anomaly scores |
+| `ml_detector_model_ready{metric}` | Gauge | 1 if the metric's model is fit, else 0 |
+| `ml_detector_refits_total{metric}` | Counter | Total refits per metric |
+| `ml_detector_training_buffer_size{metric}` | Gauge | Current training-buffer size per metric |
 
-- `ml_detector_events_scored_total{metric}` — per-metric throughput counter
-- `ml_detector_events_flagged_total{metric}` — per-metric anomaly counter
-- `ml_detector_prediction_latency_seconds` — histogram of feature-extraction + predict latency
-- `ml_detector_anomaly_score` — histogram of the live anomaly-score distribution
-- `ml_detector_model_ready{metric}` — gauge: is this model fit yet?
-- `ml_detector_refits_total{metric}` — how many times has it been retrained
-- `ml_detector_training_buffer_size{metric}` — current buffer size before next refit
+## Dashboards
 
-You can answer questions like "is my model getting slower over time?", "is the anomaly-score distribution drifting?", "how often is RR flagging vs HR right now?" without digging through logs. That's the difference between *having* an ML model in production and being able to *operate* one.
+The Grafana dashboard is organized into four rows. Each row addresses a distinct operational concern.
 
----
-
-## The Dashboard, Panel by Panel
-
-Four rows of panels, each one a different angle on the same pipeline. Below are the actual screenshots from the running system, plus what each panel is showing and why it matters.
-
-### Row 1 — Pipeline Health
+### Row 1: Pipeline Health
 
 ![Pipeline Health](docs/pipeline-health.png)
 
-This row answers a single question: **is the data plumbing healthy?**
+**Purpose:** Report the operational state of the data pipeline.
 
-- **Left — Ingest throughput, stacked by metric.** Each colored band is one of the three vital signs (HR / SpO₂ / RR), each running at ~440 events/sec, summing to ~1.4K events/sec total. The fact that the bands are flat and parallel means the simulator is producing evenly and Kafka is accepting everything. A dip in one color would mean a metric-specific problem.
-- **Middle — End-to-end latency p99.** Three lines stacked on a millisecond axis: how long the Ktor ingest takes (top, ~15–20ms), how long ML prediction takes (bottom, ~1ms — it's so fast it's almost a flat line on the floor), and how long the TimescaleDB COPY batch takes (~10–13ms). When all three lines are flat and low, the pipeline isn't bottlenecked anywhere. Spikes in any of them tell you exactly which layer to investigate.
-- **Right — Pipeline gap.** The cleverest panel in the row. It computes `ingest_rate − ml_scored_rate`. If the ML detector is keeping up with the ingest, this is ~0. A growing positive gap means the detector is falling behind — backpressure is building up in the `telemetry.raw` topic. In this screenshot the gap hovers around ~500 ops/sec, which is just the natural lag from Kafka batching; flat means healthy.
+**Panel Breakdown:**
 
-If the top of this row is misbehaving, you don't even need to look at the lower rows — the data isn't flowing.
+- **Ingest throughput, stacked by metric (left):** Each colored band shows events-per-second for one vital sign (HR, SpO₂, RR). Each band sits at approximately 440 events/sec, totaling ~1.4K events/sec. Flat parallel bands indicate steady production and full Kafka acceptance. A dip in one band would indicate a metric-specific failure (for example, the simulator dropping one metric).
+- **End-to-end latency p99 (middle):** Three lines on a millisecond axis representing the 99th-percentile latency of each pipeline stage. Ktor ingest sits at ~15 to 20 ms, ML prediction at ~1 ms (near the floor of the chart), TimescaleDB COPY at ~10 to 13 ms. A spike on any individual line localizes the performance problem to that stage.
+- **Pipeline gap (right):** Computes `ingest_rate - ml_scored_rate`. At steady state this hovers near zero, indicating the ML detector is processing events as fast as the ingest produces them. A sustained positive gap would indicate the detector falling behind and backlog accumulating in `telemetry.raw`.
 
-### Row 2 — ML Model Observability
+### Row 2: ML Model Observability
 
 ![ML Model Observability](docs/ml-observability.png)
 
-This row is the part most teams skip. Operating an ML model is different from operating a web service; you need different signals.
+**Purpose:** Report the operational state and behavior of the ML model itself.
 
-- **Top-left — Models ready.** A big green "3" means all three IsolationForests (HR, SpO₂, RR) have finished their warmup and are actively predicting. If this drops below 3, one of the models is in cold-start; predictions for that metric are coming back as "warmup" until enough samples accumulate.
-- **Top-middle — Anomaly detection rate per metric.** What percentage of recently-scored events did each model flag? Should hover in the 1–5% band; the screenshot shows all three metrics oscillating in that range, with occasional bursts up to ~14% during anomaly episodes. If a metric got stuck at 0% or 50%, something is broken with that model.
-- **Top-right — Prediction latency p50 / p95 / p99.** The whole model loop is sitting under 2 milliseconds at all three percentiles. The p99 line is the canary: if it climbs without the p50 climbing, something pathological is happening at the tail (maybe a refit is taking too long, or feature extraction is getting starved). Here it's a flat ribbon — boringly healthy, which is exactly what you want.
-- **Bottom — Anomaly-score distribution over time.** This is the most information-dense panel on the whole dashboard. Each vertical slice is a one-minute window. The color shows how many recently-scored events landed in each "score bucket" — red/orange = score around 0 (boringly normal), purple/blue = score above 0.2 (definitely flagged). Watching this over time tells you whether the model's behavior is *changing* — is the population getting more anomalous, less anomalous, drifting? It's the closest thing to a "is my model okay?" panel you can build without a labeled validation set.
+**Panel Breakdown:**
 
-### Row 3 — Clinical View: Patient Risk
+- **Models ready (top-left):** A stat panel showing the count of warmed-up models. A value of `3` indicates all three IsolationForests (HR, SpO₂, RR) are active. A lower value indicates one or more models are still in warmup; predictions for those metrics return `reason="warmup"` until ready.
+- **Anomaly detection rate per metric (top-middle):** Percentage of scored events flagged, per model. The expected range is 1 to 5 percent. The screenshot shows oscillation in that range with bursts up to ~14 percent during simulated anomaly episodes. Persistent drift outside the expected range indicates either a tuning problem (contamination too high or too low) or an input-distribution change.
+- **Prediction latency p50 / p95 / p99 (top-right):** All three percentiles sit under 2 ms. The p99 line is the tail-latency canary. If p99 diverges from p50, something pathological is happening at the tail (slow refit, GIL contention, GC pauses).
+- **Anomaly-score distribution heatmap (bottom):** Each vertical slice represents one minute. Color intensity represents event density per anomaly-score bucket. The lower band (near score 0) represents normal samples. The upper band (score > 0.2) represents flagged samples. The shape of this distribution over time is the closest available proxy for "is the model's behavior drifting?" without a labeled validation set.
+
+### Row 3: Clinical View (Patient Risk)
 
 ![Clinical View](docs/clinical-view.png)
 
-Now we leave the engineering view and switch to the clinician's view. Same data, different lens — instead of "how is the pipeline doing?", these panels ask "**which patients should I be worrying about right now?**"
+**Purpose:** Present the same data from a clinical perspective, supporting a triage flow from "which patients are anomalous" to "how severe and how recent."
 
-- **Top-left — Top-20 most anomalous patients, over time.** Each colored line is one patient's average IsolationForest score over the last few minutes. The 20 lines pictured are the patients with the highest risk in the most recent 5-minute window. A line drifting upward means that patient's data is starting to look weirder; a line spiking sharply means a sudden event. The legend on the right gives you their patient IDs and the "Last value" for each — at the moment of the screenshot, P0040 and P0052 are the most-anomalous patients.
-- **Top-right — Top-10 leaderboard.** The same answer in tabular form: patient ID, average risk score, total flagged events in the last 5 minutes, total sample count. The "Flags" column is colored red, the "Risk" column is colored on a green-yellow-orange-red gradient. This is the panel you'd glance at as a charge nurse — who's accumulating flags faster than expected?
-- **Bottom-left — Selected patient: current risk score gauge.** A live readout for whichever patient is selected in the dropdown at the top of the dashboard. P0093 in the screenshot has a current rolling 5-minute average risk of **-0.161** — well into the "stable, normal" green zone. The needle's position on the dial gives you an instant read; the thresholds are calibrated so green = stable, yellow = slightly elevated, orange = clearly anomalous, red = sustained anomalous behavior.
-- **Bottom-middle — Selected patient: flagged events in last 5 min.** P0093 has had **120 flagged events** in the last 5 minutes. That's high — bright red. Note this isn't necessarily a clinical concern by itself; a patient with a slipping SpO₂ probe will rack up flags fast. But combined with the next panel, it gives a picture.
-- **Bottom-right — Selected patient: minutes since last anomaly.** P0093's most recent flag was **2.2 minutes ago**. So 120 flags in 5 minutes, last one 2 minutes ago — this patient *was* generating sustained anomalies and has now gone quiet. That's either "their sensor was reseated and they're fine now" or "they're about to enter a different state." Either way, it tells the clinician what just happened.
+**Panel Breakdown:**
 
-Read together, these five panels let you go from "is there anything to worry about?" → "which patient?" → "how anomalous, how recent, how long?" — exactly the triage flow a clinical user expects.
+- **Top-20 most anomalous patients over time (top-left):** One line per patient, plotting rolling average risk score over the dashboard's time window. The legend on the right lists each patient's ID and most recent value. Upward drift indicates a patient whose readings are becoming progressively more anomalous; sharp spikes indicate isolated events. In the screenshot, P0040 and P0052 currently sit at the top of the leaderboard.
+- **Top-10 leaderboard table (top-right):** A table of the ten highest-risk patients in the last 5 minutes, with columns for patient ID, average risk score, total flagged events, and total samples. Conditional formatting colors the risk column on a gradient (green to red) and the flag column red at high values. This is the panel a charge nurse would scan first.
+- **Current risk score gauge (bottom-left):** Driven by a three-tier fallback query for the selected patient: (1) the patient's 5-minute rolling average, or if no recent data, (2) the patient's most recent reading, or if none, (3) zero. The screenshot shows P0093 at -0.161, in the green (stable) range.
+- **Flagged events in last 5 min (bottom-middle):** A stat panel showing the number of flagged events for the selected patient. P0093 shows 120 flagged events, indicating sustained anomaly activity.
+- **Minutes since last anomaly (bottom-right):** Time since the patient's most recent flagged event. P0093 shows 2.2 minutes. Combined with the previous panel, this indicates a patient who recently had sustained anomaly activity and has now gone quiet.
 
-### Row 4 — Live Patient Overlay
+### Row 4: Live Patient Overlay
 
 ![Live Patient Overlay](docs/live-overlay.png)
 
-This is my favorite panel. Pick a patient, see their actual vitals — and see the exact moments the ML model fired.
+**Purpose:** Provide a time-series view of a specific patient's vitals with ML anomaly markers overlaid in place.
 
-- **Three colored lines** — green = heart rate, yellow = respiratory rate, blue = SpO₂. These are the *clean* readings (where the model said "this is real").
-- **Red dots** — these are the exact moments the IsolationForest classified a reading as a sensor artifact. They're plotted on top of the lines using a Grafana field-override (any series whose name starts with `anomaly_` gets rendered as red points instead of a line).
+**Panel Breakdown:**
 
-In the screenshot you can clearly see the story of patient P0093. The heart-rate line (green) hovers around 100 bpm normally, but periodically explodes to 200+ for a few seconds — those are sensor artifacts (notice the dense clusters of red dots painted on those spikes). The yellow respiratory-rate line is mostly stable but occasionally drops to near zero (red dots again — also artifacts). The blue SpO₂ line is calm and smooth. The model is doing its job: it's letting the calm baseline through and flagging the impossible spikes.
+- **Three vital-sign lines:** green for HR, yellow for RR, blue for SpO₂. These are unflagged readings (`flagged = FALSE`).
+- **Red dots:** exact moments where the IsolationForest classified a reading as a sensor artifact.
 
-This panel is also how you'd debug the model itself. If you select a patient and see red dots on top of perfectly normal-looking readings, the model is over-firing — time to lower `contamination`. If you see obvious spikes in the lines with *no* red dots, it's under-firing — time to raise it.
+**Implementation:** Two separate SQL queries are issued for the same patient. The first returns `(time, metric, value)` for unflagged rows (rendered as lines). The second returns `(time, 'anomaly_' || metric, value)` for flagged rows. A Grafana field override matches series names starting with `^anomaly_` and renders them as red points instead of lines.
 
----
+**Reading the screenshot:** P0093's heart-rate line normally hovers near 100 bpm, but periodically spikes to 200+ bpm for a few seconds. Each spike is covered by a dense cluster of red dots, indicating the model correctly identified those samples as artifacts. The yellow respiratory-rate line is mostly stable but drops to near zero in several places (also red-dotted). The blue SpO₂ line is calm and unflagged throughout.
 
-## Tech Stack — and Why Each Piece Is There
+This panel doubles as a diagnostic tool for the model itself. Red dots on top of normal-looking readings would indicate the model is over-firing (lower `contamination`). Visible spikes without red dots would indicate under-firing (raise `contamination`).
 
-| Layer | Tech | Why this choice |
+## Tech Stack
+
+| Layer | Technology | Rationale |
 |---|---|---|
-| Ingest / Worker language | **Kotlin 2.0** | First-class coroutines, null safety, full JVM ecosystem, and `kotlinx.serialization` is a joy compared to Jackson. |
-| HTTP server | **Ktor 2.3 + Netty** | Non-blocking down to the kernel. Coroutines suspend instead of parking OS threads — thousands of in-flight requests on a tiny resident set. |
-| ML + simulator language | **Python 3.11 + asyncio + aiohttp** | scikit-learn is unbeatable for prototyping a model, and `asyncio` makes the 100-patient simulator a 50-line file. |
-| ML model | **scikit-learn IsolationForest** | Unsupervised (no labels needed), O(log n) inference, one tunable knob with a clinical interpretation. |
-| Numerics | **NumPy 1.26** | Feature vectors are 5-D arrays; Python loops would dominate the latency budget. |
-| Message broker | **Apache Kafka 3.7 (KRaft)** | The durability layer + the shock absorber between every two services. No ZooKeeper to babysit in KRaft mode. |
-| Database | **TimescaleDB 2.14 on PostgreSQL 16** | Hypertables, columnar compression, continuous aggregates — purpose-built for time-series workloads while remaining vanilla SQL. |
-| JDBC pool | **HikariCP 5** | Fastest JDBC pool in the JVM. Configured here with `socketTimeout` + `tcpKeepAlive` so a half-broken socket can't hang the worker. |
-| Metrics | **Prometheus 2.51 + prometheus-client + simpleclient** | Pull-based, exposition-format standard, the same API in Python and Kotlin. |
-| Visualization | **Grafana 10.4** | Dashboards as provisioned JSON in the repo. PromQL on top of Prometheus, raw SQL on top of TimescaleDB — both data sources used in the same dashboard. |
-| Local orchestration | **Docker Compose v2** | One command brings up Kafka + Timescale + Prometheus + Grafana. |
-| Build | **Gradle 8.10 + Shadow 8.3.3** | Reproducible builds, fat-jar packaging for the two Kotlin services. |
+| Ingest / Worker language | Kotlin 2.0 | Coroutines, null safety, JVM ecosystem |
+| HTTP server | Ktor 2.3 on Netty | Non-blocking I/O, coroutine-native |
+| ML / simulator language | Python 3.11 + asyncio + aiohttp | Native scikit-learn, low-overhead concurrency |
+| ML model | scikit-learn IsolationForest | Unsupervised, O(log n) inference |
+| Numerics | NumPy 1.26 | Vectorized feature math |
+| Message broker | Apache Kafka 3.7 (KRaft) | Durable log, decoupling between services |
+| Database | TimescaleDB 2.14 on PostgreSQL 16 | Time-series partitioning, compression, continuous aggregates |
+| JDBC pool | HikariCP 5 | JDBC connection pooling |
+| Metrics | Prometheus 2.51 + prometheus-client + simpleclient | Pull-based exposition-format standard |
+| Visualization | Grafana 10.4 | Dashboards provisioned as code |
+| Local orchestration | Docker Compose v2 | Single-command infrastructure boot |
+| Build | Gradle 8.10 + Shadow 8.3.3 | Reproducible builds, fat-jar packaging |
 
----
+## Performance
 
-## Performance Numbers
-
-Measured on a single MacBook Pro (Apple Silicon, 16 GB RAM). Numbers below are steady-state after warmup.
+Measured on a single MacBook Pro (Apple Silicon, 16 GB RAM) at steady state after warmup.
 
 | Metric | Value | Notes |
 |---|---|---|
-| End-to-end ingest throughput | **~1,500 events/sec** | 100 patients × 5 samples/sec × 3 metrics |
-| `/ingest` p99 latency | **< 50 ms** | p50 ≈ 5 ms |
-| ML prediction p99 latency | **~1 ms** | Per-sample feature-extraction + `predict()` |
-| ML detection rate | **~3 %** | Matches the simulator's injected artifact rate (great validation signal) |
-| TimescaleDB COPY batch p99 | **~22 ms** | 1,000-row batches via `COPY FROM STDIN` |
-| TimescaleDB write throughput | **~1,500 rows/sec** | All events persisted, including the flagged ones |
-| End-to-end pipeline gap | **~0 events/sec** | Ingest rate ≈ ML scored rate at steady state |
-| Data loss | **0** | `acks=all`, idempotent producer, manual offset commits, write retries |
+| Ingest throughput | ~1,500 events/sec | 100 patients × 5 samples/sec × 3 metrics |
+| `/ingest` p99 latency | < 50 ms | p50 ≈ 5 ms |
+| ML prediction p99 latency | ~1 ms | Per-sample feature extraction + predict |
+| ML detection rate | ~3 % | Matches simulator's injected artifact rate |
+| TimescaleDB COPY batch p99 | ~22 ms | 1,000-row batches via COPY FROM STDIN |
+| TimescaleDB write throughput | ~1,500 rows/sec | All events persisted |
+| End-to-end pipeline gap | ~0 events/sec | Ingest rate ≈ ML scored rate at steady state |
+| Data loss | 0 | `acks=all`, idempotent producer, no offset commit on failed write |
 
-The throughput ceiling here is the Python generator's HTTP client — not anything in the pipeline. Kafka, Ktor, the ML detector, and the worker all scale roughly linearly with horizontal worker count thanks to per-patient partitioning. A real deployment behind a load balancer with multiple Ktor pods and multiple ML-detector instances would scale into the tens of thousands of events per second.
+The throughput ceiling here is the Python generator's HTTP client, not any pipeline component. Per-patient Kafka partitioning allows ingest, ML detector, and worker to scale horizontally to tens of thousands of events per second behind a load balancer.
 
----
+## Technical Decisions & Rationale
 
-## Running It Yourself
+### Why Decouple ML Inference into Its Own Service
 
-### What you need installed
+The ML detector consumes `telemetry.raw` and produces `telemetry.scored`. The Kotlin worker has no knowledge of the model; the model has no knowledge of the database.
 
-- **Docker Desktop**, running
-- **JDK 21** — `brew install --cask temurin@21` on macOS
-- **Python 3.11+**
+**Rationale:**
 
-### One-time setup
+- **Replaceable model.** The IsolationForest can be swapped for a transformer, an autoencoder, or a multi-stage ensemble without modifying ingest or storage code.
+- **Independent scaling.** The ML detector can be scaled horizontally based on its own backlog (`telemetry.raw` lag) without touching the rest of the pipeline.
+- **Language flexibility.** Python is the dominant language for ML tooling. Isolating it means the rest of the stack can stay on the JVM.
+
+### Why Per-Patient Kafka Partitioning
+
+`patientId` is the message key on both `telemetry.raw` and `telemetry.scored`.
+
+**Rationale:**
+
+- **Per-patient ordering.** All events for one patient land on the same partition and are consumed in order, even when many consumer instances run in parallel.
+- **Horizontal consumer scaling.** Different consumers can process different partitions (and therefore different patients) simultaneously.
+- **Stable rolling state.** The ML detector maintains a per-patient rolling deque. Partition stickiness means a patient's state stays on one consumer instance.
+
+### Why Pooled Training, Per-Sample Prediction
+
+One model per metric, trained on data from all 100 patients.
+
+**Rationale:**
+
+- **Fast cold start.** Warmup completes in approximately 30 seconds because all patients contribute to the training buffer simultaneously.
+- **New patients work immediately.** A new arrival gets meaningful predictions from minute one because the model encodes population-level normality.
+- **Avoids per-patient overfit.** A per-patient model would have far less training data and would not generalize to legitimate changes in a single patient's vitals.
+
+### Why Persist Flagged Events Instead of Dropping Them
+
+Both `flagged=TRUE` and `flagged=FALSE` rows are written to the same `telemetry` table.
+
+**Rationale:**
+
+- **Enables the anomaly-marker overlay panel.** That panel queries flagged rows as a separate series. If flagged events were dropped at ingestion, this dashboard would not be possible.
+- **Auditability.** Every model decision is recoverable from the database, so a clinician (or a model developer) can review exactly what the model classified and when.
+- **Backward compatibility.** Existing queries that want only clean data add `WHERE flagged = FALSE`. They do not need to change otherwise.
+
+### Why Explicit Socket Timeouts and No-Commit-on-Failure
+
+The worker had a silent-hang bug where a half-broken JDBC connection could block COPY indefinitely. The fix had two parts.
+
+**JDBC layer:**
+
+- `socketTimeout=30s` ensures any network read that takes longer than 30 seconds throws.
+- `tcpKeepAlive=true` enables OS-level keep-alive so a half-closed TCP connection is detected.
+- HikariCP `leakDetectionThreshold=60s` logs a warning when a connection is held more than 60 seconds.
+
+**Kafka offset layer:**
+
+- The worker only calls `consumer.commitSync()` if every batch in the current poll succeeded.
+- A failed COPY (after 3 retries with exponential backoff) skips the commit entirely. Kafka redelivers the batch on the next poll.
+
+The previous design swallowed write errors and committed anyway, silently advancing past lost data. This is a class of bug worth designing out explicitly.
+
+### Library Choices
+
+- **Kotlin + Ktor:** Coroutines on Netty give non-blocking I/O without callback hell. `kotlinx.serialization` is faster and simpler than Jackson for JSON workloads.
+- **Python + asyncio + aiohttp:** Standard for the simulator (concurrent HTTP) and the ML detector (Kafka consumer/producer with light async logic).
+- **HikariCP:** Fastest JDBC connection pool on the JVM, well-tested.
+- **TimescaleDB:** Time-series workloads benefit directly from automatic chunking and columnar compression. PostgreSQL-compatible underneath, so all standard SQL tooling works.
+- **Prometheus + Grafana:** Pull-based exposition is simpler to operate than push-based. Dashboards-as-code in JSON means version control covers the observability layer.
+
+## Methodology
+
+### Tools Used
+
+- **Pipeline implementation:** Kotlin 2.0 on Gradle 8.10 with the Shadow plugin for fat-jar packaging. Python 3.11 with `kafka-python`, `scikit-learn`, `numpy`, and `prometheus-client`.
+- **Infrastructure:** Docker Compose v2 with images for Kafka 3.7 (Confluent), TimescaleDB 2.14 on PostgreSQL 16, Prometheus 2.51, Grafana 10.4.
+- **ML model:** `IsolationForest(n_estimators=100, contamination=0.03, random_state=42)` from `sklearn.ensemble`. Three independent models (HR, SpO₂, RR) trained on pooled feature vectors from all patients.
+- **Synthetic data:** A Python simulator (`generator/simulate.py`) producing autoregressive vitals for 100 patients with two stochastic failure modes (deterioration episodes and sensor artifacts).
+
+### Verification of Output
+
+**Pipeline correctness:**
+
+- Verified that every event posted to `/ingest` reaches `telemetry.scored` by comparing Prometheus throughput counters across stages.
+- Validated that `flagged=TRUE` rows in TimescaleDB correspond to events the ML detector marked as anomalous.
+- Confirmed per-patient ordering is preserved across both Kafka hops by inspecting offsets per partition.
+
+**Model behavior:**
+
+- Validated that the detection rate at default `contamination=0.03` matches the simulator's injected artifact rate of approximately 3 percent.
+- Confirmed warmup behavior: predictions return `reason="warmup"` until each model has seen 1,000 events for its metric.
+- Verified refit cadence by inspecting `ml_detector_refits_total` counters under sustained load.
+
+**Operational hardening:**
+
+- Reproduced the silent-hang failure mode under simulated network blip and confirmed the new `socketTimeout` and retry logic recover automatically.
+- Verified that a forced COPY failure causes the worker to skip the offset commit and redeliver on the next poll, with no rows lost.
+
+### Failure Modes Designed Out
+
+| Failure | Old behavior | New behavior |
+|---|---|---|
+| JDBC socket hung | Worker blocks forever on COPY | `socketTimeout=30s` throws; retried with backoff |
+| Half-broken TCP | No detection | `tcpKeepAlive=true` surfaces it |
+| COPY fails permanently | Offset committed, data lost | Offset NOT committed, batch redelivered |
+| Worker holds connection forever | No detection | HikariCP leak warning at 60s |
+| Worker dies silently | No log output | Logback configured with timestamps, fatal stderr fallback |
+
+### Synthetic Data Generation
+
+The simulator produces deterministic-but-stochastic data that exercises both the success path and the failure paths the system is designed to handle.
+
+**Patient model:** Each of 100 patients has personalized baselines for HR, SpO₂, and RR. Vitals mean-revert toward these baselines with small Gaussian noise.
+
+**Failure mode 1 (deterioration):** With low per-tick probability, a patient enters a sustained deterioration episode lasting 8 to 40 seconds, during which vitals drift toward unhealthy values. The ML model should not flag these (they are real clinical events).
+
+**Failure mode 2 (sensor artifact):** With independent per-tick probability, a single reading is replaced with a large random deviation. The ML model should flag these.
+
+This dual-mode generator is intentional. A pipeline that flags only deterioration is wrong (those events are real). A pipeline that flags neither is also wrong (it is suppressing genuine artifacts). The presence of both gives the model something meaningful to discriminate.
+
+## Getting Started
+
+### Prerequisites
+
+- Docker Desktop, running
+- JDK 21 (`brew install --cask temurin@21` on macOS)
+- Python 3.11+
+
+### Infrastructure
 
 From the project root:
 
@@ -328,7 +456,7 @@ From the project root:
 docker compose up -d
 ```
 
-That brings up Kafka, TimescaleDB, Prometheus, and Grafana. Then create the two Kafka topics:
+Create the Kafka topics:
 
 ```bash
 docker exec -it kafka kafka-topics --bootstrap-server localhost:29092 \
@@ -337,60 +465,62 @@ docker exec -it kafka kafka-topics --bootstrap-server localhost:29092 \
   --create --if-not-exists --topic telemetry.scored --partitions 16 --replication-factor 1
 ```
 
-If you're upgrading from a pre-ML version of this project, also apply the schema migration once:
+If upgrading from a pre-ML version, apply the schema migration:
 
 ```bash
 docker exec -i timescaledb psql -U telemetry -d clinical < sql/migrate-add-flagged.sql
 ```
 
-And in case your TimescaleDB volume predates the Grafana read-only role:
+If the TimescaleDB volume predates the Grafana read-only role, apply the permissions fix:
 
 ```bash
 docker exec -i timescaledb psql -U telemetry -d clinical < sql/fix-grafana-permissions.sql
 ```
 
-### Starting the four code services
+### Application Services
 
-You'll want four terminal windows.
+Run each in its own terminal.
 
 ```bash
-# T1 — Ktor ingest
+# Terminal 1: Ktor ingest
 cd ingest
 export JAVA_HOME=$(/usr/libexec/java_home -v 21)
 ./gradlew run
 
-# T2 — Python ML detector
+# Terminal 2: Python ML detector
 cd ml-detector
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python detector.py
 
-# T3 — Kotlin worker
+# Terminal 3: Kotlin worker
 cd worker
 export JAVA_HOME=$(/usr/libexec/java_home -v 21)
 ./gradlew clean shadowJar -q
 java -jar build/libs/telemetry-worker-all.jar
 
-# T4 — Python generator
+# Terminal 4: Python generator
 cd generator
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python simulate.py
 ```
 
-### Where to look
+### Endpoints
 
-| What | URL | Login |
+| Service | URL | Credentials |
 |---|---|---|
 | Grafana | http://localhost:3000 | `admin` / `admin` |
-| Prometheus | http://localhost:9090 | — |
-| Ingest metrics | http://localhost:8080/metrics | — |
-| ML-detector metrics | http://localhost:9200/metrics | — |
-| Worker metrics | http://localhost:9100/metrics | — |
+| Prometheus | http://localhost:9090 | none |
+| Ingest metrics | http://localhost:8080/metrics | none |
+| ML-detector metrics | http://localhost:9200/metrics | none |
+| Worker metrics | http://localhost:9100/metrics | none |
 
-In Grafana go to **Dashboards → Browse → Clinical Telemetry — ML Risk & Pipeline Observability**. Within ~60 seconds of all four services running, every panel populates.
+In Grafana, open **Dashboards → Browse → Clinical Telemetry: ML Risk & Pipeline Observability**. Panels populate within ~60 seconds of all four services running.
 
-### A quick sanity check
+### Verification
+
+Confirm the pipeline is writing to TimescaleDB:
 
 ```bash
 docker exec -it timescaledb psql -U telemetry -d clinical -c \
@@ -398,16 +528,14 @@ docker exec -it timescaledb psql -U telemetry -d clinical -c \
    WHERE time > NOW() - INTERVAL '2 minutes' GROUP BY flagged;"
 ```
 
-You should see two rows — `flagged=true` and `flagged=false`. Roughly 3% of recent events should be flagged.
+Expected result: two rows, `flagged=true` and `flagged=false`, with the flagged count approximately 3 percent of the total.
 
 ### Shutdown
 
 ```bash
-docker compose down       # stop containers, keep the data
+docker compose down       # stop containers, preserve TimescaleDB data
 docker compose down -v    # stop AND wipe the TimescaleDB volume
 ```
-
----
 
 ## Project Structure
 
@@ -415,22 +543,22 @@ docker compose down -v    # stop AND wipe the TimescaleDB volume
 clinical-telemetry-platform/
 ├── docker-compose.yml                # 4-service local data plane
 ├── prometheus/
-│   └── prometheus.yml                # Scrapes ingest, ml-detector, worker
+│   └── prometheus.yml                # Scrape config for ingest, ml-detector, worker
 ├── grafana/
 │   ├── provisioning/                 # Datasources + dashboard providers
 │   └── dashboards/
-│       └── clinical-telemetry.json   # The 4-row dashboard
+│       └── clinical-telemetry.json   # 4-row dashboard
 ├── sql/
-│   ├── init.sql                      # Hypertable, compression, continuous agg, grafana_ro role
-│   ├── migrate-add-flagged.sql       # One-shot schema migration for the ML upgrade
-│   └── fix-grafana-permissions.sql   # One-shot fix if your DB volume predates the role
+│   ├── init.sql                      # Hypertable, compression, continuous aggregate, grafana_ro role
+│   ├── migrate-add-flagged.sql       # Schema migration for the ML upgrade
+│   └── fix-grafana-permissions.sql   # Grants for legacy DB volumes
 ├── generator/
 │   ├── requirements.txt
 │   └── simulate.py                   # 100-patient asyncio simulator
-├── ml-detector/                      # Python — IsolationForest service
+├── ml-detector/
 │   ├── requirements.txt
-│   └── detector.py                   # Kafka consumer/producer + per-metric IF model
-├── ingest/                           # Gradle module — Ktor service
+│   └── detector.py                   # Kafka consumer/producer + per-metric IsolationForest
+├── ingest/                           # Gradle module: Ktor service
 │   ├── build.gradle.kts
 │   └── src/main/kotlin/com/clinical/telemetry/
 │       ├── Application.kt
@@ -438,58 +566,39 @@ clinical-telemetry-platform/
 │       ├── kafka/TelemetryProducer.kt
 │       ├── metrics/Metrics.kt
 │       └── model/TelemetryEvent.kt
-└── worker/                           # Gradle module — Kafka consumer + Timescale sink
-    ├── build.gradle.kts
-    └── src/main/
-        ├── kotlin/com/clinical/telemetry/worker/
-        │   ├── Main.kt
-        │   ├── Worker.kt             # Consumes telemetry.scored, batches to DB
-        │   ├── MetricsServer.kt
-        │   ├── WorkerMetrics.kt
-        │   ├── model/Events.kt       # ScoredEvent shape on the Kafka wire
-        │   └── storage/
-        │       └── TimescaleSink.kt  # HikariCP + PG CopyManager batch writer
-        └── resources/
-            └── logback.xml           # Structured logs with timestamps
+├── worker/                           # Gradle module: Kafka consumer + Timescale sink
+│   ├── build.gradle.kts
+│   └── src/main/
+│       ├── kotlin/com/clinical/telemetry/worker/
+│       │   ├── Main.kt
+│       │   ├── Worker.kt             # Consumes telemetry.scored, batches to DB
+│       │   ├── MetricsServer.kt
+│       │   ├── WorkerMetrics.kt
+│       │   ├── model/Events.kt       # ScoredEvent shape on the Kafka wire
+│       │   └── storage/
+│       │       └── TimescaleSink.kt  # HikariCP + PG CopyManager batch writer
+│       └── resources/
+│           └── logback.xml           # Structured logs with timestamps
+└── docs/                             # Dashboard screenshots
 ```
 
----
+## Key Features
 
-## Engineering Decisions Worth Calling Out
+- **End-to-end real-time pipeline:** Continuous ingestion, ML scoring, and persistence with sub-50 ms p99 latency.
+- **Unsupervised ML anomaly detection:** Per-metric IsolationForests trained on pooled population data, refitted continuously to adapt to drift.
+- **Full pipeline and model observability:** Prometheus instrumentation on every stage. Latency histograms, anomaly-score distributions, refit counters, model-ready gauges.
+- **Time-series storage tuned for clinical analytics:** Hypertable partitioning, columnar compression, continuous aggregates.
+- **Zero data loss by design:** `acks=all`, idempotent producer, manual offset commits, no commit on failed write, retried COPY with backoff.
+- **Provisioned dashboards as code:** Four rows of panels (Pipeline Health, ML Observability, Clinical View, Live Patient Overlay) versioned in the repository.
+- **Reproducible local stack:** Single `docker compose up -d` brings up Kafka, TimescaleDB, Prometheus, and Grafana.
 
-A few choices that shaped the project, in case you're reading the code:
+## Roadmap
 
-**ML inference lives in its own service.** The detector consumes `telemetry.raw` and produces `telemetry.scored`. The Kotlin worker never touches the model; the model never touches the database. I can swap the IsolationForest for a transformer, an autoencoder, or a multi-stage ensemble without changing a line of ingest or storage code. Decoupling through Kafka is doing real work here.
+- **Online learning.** Replace the periodic-refit IsolationForest with an online algorithm (HalfSpaceTrees, streaming Random-Cut Forest) for continuous adaptation.
+- **Per-patient personalization.** A second model layer that learns each patient's individual baseline, so chronically irregular patients (such as those with atrial fibrillation) do not repeatedly trigger the population-level model.
+- **Shadow deploys.** Run candidate model versions in parallel with production and compare flagged-event rates before promotion.
+- **Kubernetes deployment.** Helm charts per service, kube-prometheus-stack for monitoring, custom HPA metric on `kafka_consumergroup_lag` for backpressure-driven scaling.
+- **Chaos engineering.** Chaos Mesh `PodChaos` and `NetworkChaos` against the detector and worker, verifying p99 latency stays within SLO under failure.
+- **Production hardening.** At-rest encryption on the TimescaleDB volume, TLS on Kafka connections, audit logging, PHI de-identification at the ingest boundary.
 
-**Patient ID is the Kafka key on both topics.** All events for one patient route to the same partition. Per-patient ordering is preserved through both Kafka hops, even as you scale out consumers. This is the right move for any per-entity time-series problem; it's worth internalizing.
 
-**The detector trains pooled, predicts per-patient.** One model per metric, trained on data from all patients. Cold-start is fast (~30 seconds), and a brand-new patient gets meaningful predictions from minute one because the model already knows what "normal" looks like across the population. A per-patient model would have to warm up separately for everyone.
-
-**Flagged events are persisted, not dropped.** That single decision is what makes the red-dot overlay panel possible. Existing "clean only" queries just add `WHERE flagged = FALSE`. You can't recover dropped data later, so when in doubt, write it down.
-
-**Full ML observability.** Prediction-latency histograms, refit counters, model-ready gauges, training-buffer sizes, *and* the live anomaly-score distribution are all on Prometheus. Not just throughput counters. That's the difference between "we have ML in production" and "we can operate ML in production."
-
-**HikariCP + Postgres `socketTimeout` and `tcpKeepAlive`.** The worker had a silent-hang bug where a half-broken JDBC connection would freeze the entire pipeline. Now there's a 30-second socket-read timeout, OS-level keep-alive on, retries with backoff, and a 60-second connection-leak warning. Failures are loud now, not silent.
-
-**Don't commit Kafka offsets on a failed write.** If a batch fails to land in TimescaleDB, the worker refuses to commit. Kafka redelivers on the next poll. The alternative — committing despite the failure — is silent data loss, which is what the old version did.
-
-**Grafana dashboards live in the repo as provisioned JSON.** Datasources, providers, and the full dashboard. A clean `docker compose up -d` reproduces the entire observability layer. No manual UI clicking.
-
----
-
-## Where I'd Take It Next
-
-If I were turning this into a real product instead of a portfolio piece, the next things on my list:
-
-- **Online learning.** The IsolationForest currently retrains every 5,000 events. An online algorithm (HalfSpaceTrees, streaming Random-Cut Forest) would adapt continuously instead of in jumps.
-- **Per-patient personalization.** A second model layer that learns each patient's own "normal," so a known atrial-fibrillation patient's irregular heart rate doesn't keep tripping the population-level model.
-- **Shadow deploys for new model versions.** When changing `contamination` or feature engineering, run the candidate model in parallel with production and compare flagged-event rates before promoting.
-- **Kubernetes deployment.** Helm charts per service, the kube-prometheus-stack for monitoring, and a custom HPA metric on `kafka_consumergroup_lag` so the worker scales out automatically under backpressure.
-- **Chaos engineering.** Run Chaos Mesh `PodChaos` / `NetworkChaos` against the detector and worker, verify p99 latency stays inside the SLO under failure.
-- **Real-world hardening.** At-rest encryption on the TimescaleDB volume, TLS on every Kafka hop, audit logging, PHI de-identification at the ingest boundary.
-
----
-
-## License
-
-MIT. Built as a portfolio project; not in clinical use anywhere. Synthetic data only.
