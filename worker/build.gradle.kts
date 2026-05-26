@@ -16,7 +16,6 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
     implementation("org.apache.kafka:kafka-clients:3.7.0")
-    implementation("redis.clients:jedis:5.1.2")
     implementation("org.postgresql:postgresql:42.7.3")
     implementation("com.zaxxer:HikariCP:5.1.0")
     implementation("io.prometheus:simpleclient:0.16.0")

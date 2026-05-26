@@ -12,6 +12,19 @@ import asyncio
 import aiohttp
 import random
 import time
+from datetime import datetime, timezone
+
+
+def utc_now_ms() -> int:
+    """Return current Unix epoch milliseconds in UTC.
+
+    ``time.time()`` already returns Unix epoch seconds (UTC by definition),
+    but we route through ``datetime.now(timezone.utc)`` to make the UTC
+    contract explicit at the call-site — there is now zero ambiguity that
+    timestamps stamped here are timezone-agnostic UTC, which is what
+    TimescaleDB's TIMESTAMPTZ column and Grafana's UTC time picker expect.
+    """
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
 
 ENDPOINT = "http://localhost:8080/ingest"
 NUM_PATIENTS = 100
@@ -105,7 +118,7 @@ async def patient_loop(session: aiohttp.ClientSession,
     global posted, errors
     while True:
         sim.tick()
-        ts_ms = int(time.time() * 1000)
+        ts_ms = utc_now_ms()
         for frame in sim.frames(ts_ms):
             try:
                 async with session.post(ENDPOINT, json=frame) as resp:

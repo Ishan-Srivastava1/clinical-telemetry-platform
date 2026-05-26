@@ -1,0 +1,5 @@
+kafka-python==2.0.2
+scikit-learn==1.4.2
+numpy==1.26.4
+zstandard==0.22.0
+prometheus-client==0.20.0

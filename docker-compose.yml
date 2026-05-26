@@ -30,27 +30,6 @@ services:
     networks:
       - telemetry-net
 
-  redis:
-    image: redis:7.2-alpine
-    container_name: redis
-    ports:
-      - "6379:6379"
-    command:
-      - redis-server
-      - --maxmemory
-      - 512mb
-      - --maxmemory-policy
-      - allkeys-lru
-      - --appendonly
-      - "no"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-    networks:
-      - telemetry-net
-
   timescaledb:
     image: timescale/timescaledb:2.14.2-pg16
     container_name: timescaledb

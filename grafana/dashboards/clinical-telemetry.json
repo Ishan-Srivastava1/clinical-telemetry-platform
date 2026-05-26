@@ -2,169 +2,397 @@
   "annotations": { "list": [] },
   "editable": true,
   "schemaVersion": 39,
-  "tags": ["clinical", "telemetry"],
+  "tags": ["clinical", "telemetry", "ml", "isolation-forest"],
   "time": { "from": "now-15m", "to": "now" },
+  "timezone": "utc",
   "refresh": "5s",
-  "title": "Clinical Telemetry & Patient Risk Platform",
+  "title": "Clinical Telemetry — ML Risk & Pipeline Observability",
   "uid": "clinical-telemetry",
+  "templating": {
+    "list": [
+      {
+        "name": "patient",
+        "label": "Patient",
+        "type": "query",
+        "datasource": { "type": "postgres", "uid": "timescaledb" },
+        "refresh": 1,
+        "query": "SELECT DISTINCT patient_id FROM telemetry WHERE time > NOW() - INTERVAL '10 minutes' ORDER BY patient_id LIMIT 200",
+        "regex": "",
+        "includeAll": false,
+        "multi": false,
+        "current": { "text": "P0000", "value": "P0000", "selected": true },
+        "sort": 1,
+        "allowCustomValue": true
+      }
+    ]
+  },
   "panels": [
+
+    { "type": "row", "title": "Pipeline Health",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+      "id": 100, "collapsed": false, "panels": [] },
+
     {
       "id": 1,
       "type": "timeseries",
-      "title": "Ingest throughput (events/sec)",
+      "title": "Ingest throughput (events/sec, stacked by metric)",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "gridPos": { "x": 0, "y": 1, "w": 8, "h": 8 },
       "fieldConfig": {
-        "defaults": { "unit": "ops", "custom": { "lineWidth": 2, "fillOpacity": 15, "stacking": { "mode": "normal" } } }
-      },
-      "options": { "legend": { "displayMode": "table", "placement": "right" } },
-      "targets": [
-        {
-          "expr": "sum by (metric) (rate(telemetry_events_ingested_total[1m]))",
-          "legendFormat": "{{metric}}",
-          "refId": "A"
+        "defaults": {
+          "unit": "ops",
+          "custom": { "lineWidth": 2, "fillOpacity": 18, "stacking": { "mode": "normal" } }
         }
+      },
+      "targets": [
+        { "expr": "sum by (metric) (rate(telemetry_events_ingested_total[1m]))",
+          "legendFormat": "{{metric}}", "refId": "A" }
       ]
     },
+
     {
       "id": 2,
       "type": "timeseries",
-      "title": "/ingest latency p50/p95/p99 (s)",
+      "title": "End-to-end latency: ingest p99 vs ML predict p99 vs DB COPY p99",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "gridPos": { "x": 8, "y": 1, "w": 8, "h": 8 },
       "fieldConfig": { "defaults": { "unit": "s" } },
       "targets": [
-        {
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(telemetry_ingest_latency_seconds_bucket[5m])))",
-          "legendFormat": "p50",
-          "refId": "A"
-        },
-        {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(telemetry_ingest_latency_seconds_bucket[5m])))",
-          "legendFormat": "p95",
-          "refId": "B"
-        },
-        {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(telemetry_ingest_latency_seconds_bucket[5m])))",
-          "legendFormat": "p99",
-          "refId": "C"
-        }
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(telemetry_ingest_latency_seconds_bucket[5m])))",
+          "legendFormat": "Ktor ingest p99", "refId": "A" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(ml_detector_prediction_latency_seconds_bucket[5m])))",
+          "legendFormat": "ML predict p99", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(worker_pg_batch_latency_seconds_bucket[5m])))",
+          "legendFormat": "TimescaleDB batch p99", "refId": "C" }
       ]
     },
+
     {
       "id": 3,
-      "type": "stat",
-      "title": "Artifact suppression ratio",
+      "type": "timeseries",
+      "title": "End-to-end pipeline gap (ingest − scored)",
+      "description": "Healthy when ~0. Positive = ML detector lag.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "x": 0, "y": 8, "w": 6, "h": 6 },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percentunit",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 0.05 },
-              { "color": "red", "value": 0.15 }
-            ]
-          }
-        }
-      },
-      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "gridPos": { "x": 16, "y": 1, "w": 8, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "ops" } },
       "targets": [
-        {
-          "expr": "sum(rate(worker_events_flagged_total[5m])) / (sum(rate(worker_events_flagged_total[5m])) + sum(rate(worker_events_passed_total[5m])))",
-          "refId": "A"
-        }
+        { "expr": "sum(rate(telemetry_events_ingested_total[1m])) - sum(rate(ml_detector_events_scored_total[1m]))",
+          "legendFormat": "gap (should be ~0)", "refId": "A" }
       ]
     },
+
+    { "type": "row", "title": "ML Model Observability",
+      "gridPos": { "x": 0, "y": 9, "w": 24, "h": 1 },
+      "id": 101, "collapsed": false, "panels": [] },
+
     {
       "id": 4,
-      "type": "timeseries",
-      "title": "Flagged events per minute (per metric)",
+      "type": "stat",
+      "title": "Models ready",
+      "description": "3/3 = all three IsolationForests (HR, SPO2, RR) are warmed up and predicting.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "x": 6, "y": 8, "w": 12, "h": 6 },
-      "fieldConfig": { "defaults": { "unit": "short" } },
-      "targets": [
-        {
-          "expr": "60 * sum by (metric) (rate(worker_events_flagged_total[1m]))",
-          "legendFormat": "{{metric}}",
-          "refId": "A"
+      "gridPos": { "x": 0, "y": 10, "w": 4, "h": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "green", "value": 3 }
+            ] }
         }
+      },
+      "options": { "colorMode": "background", "graphMode": "none",
+                   "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value" },
+      "targets": [
+        { "expr": "sum(ml_detector_model_ready)", "refId": "A" }
       ]
     },
+
     {
       "id": 5,
       "type": "timeseries",
-      "title": "Redis Lua p99 (s)",
+      "title": "Anomaly detection rate (% flagged, per metric)",
+      "description": "Target band ~1-5%; sustained spikes suggest contamination is too aggressive.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "x": 18, "y": 8, "w": 6, "h": 6 },
-      "fieldConfig": { "defaults": { "unit": "s" } },
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(worker_lua_latency_seconds_bucket[5m])))",
-          "legendFormat": "p99",
-          "refId": "A"
+      "gridPos": { "x": 4, "y": 10, "w": 10, "h": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": { "lineWidth": 2, "fillOpacity": 12 },
+          "min": 0, "max": 0.15
         }
+      },
+      "targets": [
+        { "expr": "sum by (metric) (rate(ml_detector_events_flagged_total[1m])) / clamp_min(sum by (metric) (rate(ml_detector_events_scored_total[1m])), 0.01)",
+          "legendFormat": "{{metric}}", "refId": "A" }
       ]
     },
+
     {
       "id": 6,
       "type": "timeseries",
-      "title": "TimescaleDB write throughput (rows/sec)",
+      "title": "Model prediction latency p50 / p95 / p99",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "x": 0, "y": 14, "w": 12, "h": 8 },
-      "fieldConfig": { "defaults": { "unit": "rps" } },
-      "targets": [
-        {
-          "expr": "sum(rate(worker_rows_written_total[1m]))",
-          "legendFormat": "rows/sec",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "id": 7,
-      "type": "timeseries",
-      "title": "TimescaleDB batch latency p99 (s)",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "x": 12, "y": 14, "w": 12, "h": 8 },
+      "gridPos": { "x": 14, "y": 10, "w": 10, "h": 6 },
       "fieldConfig": { "defaults": { "unit": "s" } },
       "targets": [
-        {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(worker_pg_batch_latency_seconds_bucket[5m])))",
-          "legendFormat": "p99",
-          "refId": "A"
-        }
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(ml_detector_prediction_latency_seconds_bucket[5m])))",
+          "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(ml_detector_prediction_latency_seconds_bucket[5m])))",
+          "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(ml_detector_prediction_latency_seconds_bucket[5m])))",
+          "legendFormat": "p99", "refId": "C" }
       ]
     },
+
+    {
+      "id": 7,
+      "type": "heatmap",
+      "title": "Anomaly-score distribution over time (all patients)",
+      "description": "Larger scores = more anomalous. Watch the upper band light up when the model finds real outliers.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "x": 0, "y": 16, "w": 24, "h": 8 },
+      "targets": [
+        { "expr": "sum by (le) (rate(ml_detector_anomaly_score_bucket[1m]))",
+          "format": "heatmap", "legendFormat": "{{le}}", "refId": "A" }
+      ],
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": { "scheme": "Spectral", "mode": "scheme", "fill": "dark-orange" },
+        "yAxis": { "axisLabel": "score" }
+      }
+    },
+
+    { "type": "row", "title": "Clinical View — Patient Risk",
+      "gridPos": { "x": 0, "y": 24, "w": 24, "h": 1 },
+      "id": 102, "collapsed": false, "panels": [] },
+
     {
       "id": 8,
       "type": "timeseries",
-      "title": "End-to-end pipeline gap (ingest − written − flagged)",
-      "description": "Healthy when ~0. Positive = consumer lag, negative = metric bug.",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "x": 0, "y": 22, "w": 24, "h": 6 },
-      "fieldConfig": { "defaults": { "unit": "ops" } },
-      "targets": [
-        {
-          "expr": "sum(rate(telemetry_events_ingested_total[1m])) - sum(rate(worker_rows_written_total[1m])) - sum(rate(worker_events_flagged_total[1m]))",
-          "legendFormat": "gap (should be ~0)",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "id": 9,
-      "type": "timeseries",
-      "title": "Live vitals (TimescaleDB, last 5 min, patient P0000)",
+      "title": "Top-20 highest-risk patients — risk score over time",
+      "description": "One line per patient (top 20 most anomalous in the last 5 min). Higher line = more anomalous behaviour.",
       "datasource": { "type": "postgres", "uid": "timescaledb" },
-      "gridPos": { "x": 0, "y": 28, "w": 24, "h": 10 },
+      "gridPos": { "x": 0, "y": 25, "w": 16, "h": 12 },
       "targets": [
         {
           "refId": "A",
           "format": "time_series",
-          "rawSql": "SELECT time AS \"time\", metric AS metric, value FROM telemetry WHERE patient_id = 'P0000' AND $__timeFilter(time) ORDER BY 1"
+          "rawSql": "WITH ranked AS (\n  SELECT patient_id, AVG(z_score) AS recent_risk\n  FROM telemetry\n  WHERE time > NOW() - INTERVAL '5 minutes'\n  GROUP BY patient_id\n  ORDER BY recent_risk DESC NULLS LAST\n  LIMIT 20\n)\nSELECT\n  time_bucket('15 seconds', t.time) AS time,\n  t.patient_id AS metric,\n  AVG(t.z_score) AS value\nFROM telemetry t\nINNER JOIN ranked r USING (patient_id)\nWHERE $__timeFilter(t.time)\nGROUP BY 1, 2\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 1.5,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 0.0 },
+              { "color": "orange", "value": 0.05 },
+              { "color": "red",    "value": 0.10 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "right", "showLegend": true, "calcs": ["lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+
+    {
+      "id": 9,
+      "type": "table",
+      "title": "Top 10 highest-risk patients (last 5 minutes)",
+      "datasource": { "type": "postgres", "uid": "timescaledb" },
+      "gridPos": { "x": 16, "y": 25, "w": 8, "h": 12 },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT\n  patient_id              AS \"Patient\",\n  ROUND(COALESCE(AVG(z_score), 0)::numeric, 3)  AS \"Risk\",\n  COUNT(*) FILTER (WHERE flagged)               AS \"Flags\",\n  COUNT(*)                                      AS \"Samples\"\nFROM telemetry\nWHERE time > NOW() - INTERVAL '5 minutes'\nGROUP BY patient_id\nORDER BY \"Risk\" DESC NULLS LAST\nLIMIT 10"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "left" } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Risk" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } },
+              { "id": "thresholds", "value": { "mode": "absolute",
+                "steps": [
+                  { "color": "green",  "value": null },
+                  { "color": "yellow", "value": 0.0 },
+                  { "color": "orange", "value": 0.05 },
+                  { "color": "red",    "value": 0.10 }
+                ] } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Flags" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "basic" } },
+              { "id": "thresholds", "value": { "mode": "absolute",
+                "steps": [
+                  { "color": "green",  "value": null },
+                  { "color": "yellow", "value": 5 },
+                  { "color": "red",    "value": 15 }
+                ] } }
+            ]
+          }
+        ]
+      },
+      "options": { "sortBy": [{ "displayName": "Risk", "desc": true }] }
+    },
+
+    {
+      "id": 10,
+      "type": "gauge",
+      "title": "Selected patient — current risk score  (${patient})",
+      "description": "Three-tier fallback so the gauge ALWAYS shows a meaningful value for the selected patient: (1) avg z_score over last 5 min, (2) if no recent data, the patient's most recent z_score, (3) 0 if the patient has no data at all.",
+      "datasource": { "type": "postgres", "uid": "timescaledb" },
+      "gridPos": { "x": 0, "y": 37, "w": 8, "h": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "min": -0.2, "max": 0.3,
+          "unit": "short", "decimals": 3,
+          "thresholds": { "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 0.0 },
+              { "color": "orange", "value": 0.05 },
+              { "color": "red",    "value": 0.10 }
+            ] }
+        }
+      },
+      "options": { "orientation": "auto", "showThresholdLabels": true, "showThresholdMarkers": true,
+                   "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT\n  NOW() AS time,\n  COALESCE(\n    -- 1) preferred: rolling 5-minute average\n    (SELECT AVG(z_score)\n       FROM telemetry\n      WHERE patient_id = '${patient}'\n        AND time > NOW() - INTERVAL '5 minutes'\n        AND z_score IS NOT NULL),\n    -- 2) fallback: most recent reading ever for this patient\n    (SELECT z_score\n       FROM telemetry\n      WHERE patient_id = '${patient}'\n        AND z_score IS NOT NULL\n      ORDER BY time DESC\n      LIMIT 1),\n    -- 3) ultimate fallback if patient has no data at all\n    0\n  ) AS value"
+        }
+      ]
+    },
+
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Selected patient — flagged events (last 5 min)  (${patient})",
+      "description": "Total ML-flagged anomalies for this patient in the last 5 minutes. Background turns red when activity is high.",
+      "datasource": { "type": "postgres", "uid": "timescaledb" },
+      "gridPos": { "x": 8, "y": 37, "w": 8, "h": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "thresholds": { "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 10 },
+              { "color": "orange", "value": 50 },
+              { "color": "red",    "value": 150 }
+            ] }
+        }
+      },
+      "options": { "colorMode": "background", "graphMode": "area",
+                   "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT\n  NOW() AS time,\n  COUNT(*) FILTER (WHERE flagged) :: int AS value\nFROM telemetry\nWHERE patient_id = '${patient}'\n  AND time > NOW() - INTERVAL '5 minutes'"
+        }
+      ]
+    },
+
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "Selected patient — minutes since last anomaly  (${patient})",
+      "datasource": { "type": "postgres", "uid": "timescaledb" },
+      "gridPos": { "x": 16, "y": 37, "w": 8, "h": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "m", "decimals": 1,
+          "thresholds": { "mode": "absolute",
+            "steps": [
+              { "color": "red",    "value": null },
+              { "color": "orange", "value": 1 },
+              { "color": "yellow", "value": 3 },
+              { "color": "green",  "value": 10 }
+            ] }
+        }
+      },
+      "options": { "colorMode": "background", "graphMode": "none",
+                   "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT\n  NOW() AS time,\n  COALESCE(EXTRACT(EPOCH FROM (NOW() - MAX(time))) / 60.0, 99.0) AS value\nFROM telemetry\nWHERE patient_id = '${patient}'\n  AND flagged = TRUE"
+        }
+      ]
+    },
+
+    { "type": "row", "title": "Live Patient Overlay",
+      "gridPos": { "x": 0, "y": 44, "w": 24, "h": 1 },
+      "id": 103, "collapsed": false, "panels": [] },
+
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Vitals for ${patient}  +  red dots where the ML model flagged",
+      "description": "Lines = persisted readings (flagged=FALSE). Red dots = exact moments the IsolationForest classified the sample as a sensor artifact.",
+      "datasource": { "type": "postgres", "uid": "timescaledb" },
+      "gridPos": { "x": 0, "y": 45, "w": 24, "h": 12 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1.5,
+            "pointSize": 4,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "^anomaly_.*" },
+            "properties": [
+              { "id": "custom.drawStyle", "value": "points" },
+              { "id": "custom.showPoints", "value": "always" },
+              { "id": "custom.pointSize", "value": 8 },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT\n  time AS \"time\",\n  metric AS metric,\n  value\nFROM telemetry\nWHERE patient_id = '${patient}'\n  AND flagged = FALSE\n  AND $__timeFilter(time)\nORDER BY 1"
+        },
+        {
+          "refId": "B",
+          "format": "time_series",
+          "rawSql": "SELECT\n  time AS \"time\",\n  ('anomaly_' || metric) AS metric,\n  value\nFROM telemetry\nWHERE patient_id = '${patient}'\n  AND flagged = TRUE\n  AND $__timeFilter(time)\nORDER BY 1"
         }
       ]
     }

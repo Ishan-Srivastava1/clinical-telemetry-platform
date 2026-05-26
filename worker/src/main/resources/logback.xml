@@ -1,0 +1,30 @@
+<configuration>
+
+    <!-- Without this file Logback uses its built-in default, which silently
+         filters anything below WARN and never prints timestamps. That's how
+         the worker hung at 22:11 with no visible explanation. -->
+
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level [%thread] %logger{30} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- Application loggers at INFO so we see batch progress + retry warnings -->
+    <logger name="com.clinical.telemetry" level="INFO"/>
+
+    <!-- HikariCP at INFO so pool init / leak warnings are visible -->
+    <logger name="com.zaxxer.hikari" level="INFO"/>
+
+    <!-- Postgres JDBC: WARN keeps the noise down but surfaces real errors -->
+    <logger name="org.postgresql" level="WARN"/>
+
+    <!-- Kafka clients: WARN, so rebalances and connection issues are visible
+         but per-poll noise is suppressed -->
+    <logger name="org.apache.kafka" level="WARN"/>
+
+    <root level="INFO">
+        <appender-ref ref="STDOUT"/>
+    </root>
+
+</configuration>

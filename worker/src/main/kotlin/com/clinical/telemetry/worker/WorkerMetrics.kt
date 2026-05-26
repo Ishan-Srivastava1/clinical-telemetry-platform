@@ -14,24 +14,19 @@ object WorkerMetrics {
 
     val flagged: Counter = Counter.build()
         .name("worker_events_flagged_total")
-        .help("Events suppressed as artifact / false alarm by Lua filter")
+        .help("Scored events that the ml-detector classified as artifacts (dropped by worker)")
         .labelNames("metric")
         .register(registry)
 
     val passed: Counter = Counter.build()
         .name("worker_events_passed_total")
-        .help("Events that survived the Redis sliding-window filter")
+        .help("Scored events that passed the ml-detector and were persisted")
         .labelNames("metric")
         .register(registry)
 
     val parseErrors: Counter = Counter.build()
         .name("worker_parse_errors_total")
-        .help("JSON deserialization failures on consumed Kafka messages")
-        .register(registry)
-
-    val redisErrors: Counter = Counter.build()
-        .name("worker_redis_errors_total")
-        .help("Redis Lua script invocation failures")
+        .help("JSON deserialization failures on consumed scored messages")
         .register(registry)
 
     val writeErrors: Counter = Counter.build()
@@ -47,12 +42,6 @@ object WorkerMetrics {
     val rowsWritten: Counter = Counter.build()
         .name("worker_rows_written_total")
         .help("Rows persisted to TimescaleDB via COPY")
-        .register(registry)
-
-    val luaLatency: Histogram = Histogram.build()
-        .name("worker_lua_latency_seconds")
-        .help("Redis Lua sliding-window evaluation latency")
-        .buckets(0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1)
         .register(registry)
 
     val pgWriteLatency: Histogram = Histogram.build()

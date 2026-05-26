@@ -13,9 +13,11 @@ CREATE TABLE IF NOT EXISTS telemetry (
     metric       TEXT             NOT NULL,
     value        DOUBLE PRECISION NOT NULL,
     device_id    TEXT             NOT NULL,
-    z_score      DOUBLE PRECISION,
-    window_mean  DOUBLE PRECISION,
-    window_std   DOUBLE PRECISION
+    z_score      DOUBLE PRECISION,        -- IsolationForest anomalyScore
+    window_mean  DOUBLE PRECISION,        -- (legacy) populated by the old Lua filter
+    window_std   DOUBLE PRECISION,        -- (legacy) populated by the old Lua filter
+    flagged      BOOLEAN          NOT NULL DEFAULT FALSE,
+    reason       TEXT
 );
 
 -- Convert into a hypertable with both time and patient_id partitioning.
@@ -33,6 +35,10 @@ CREATE INDEX IF NOT EXISTS idx_tel_patient_time
 
 CREATE INDEX IF NOT EXISTS idx_tel_metric_time
     ON telemetry (metric, time DESC);
+
+-- Partial index: only flagged rows. Anomaly-marker queries hit this directly.
+CREATE INDEX IF NOT EXISTS idx_tel_flagged_patient_time
+    ON telemetry (patient_id, time DESC) WHERE flagged = TRUE;
 
 -- -----------------------------------------------------------------------------
 -- Native columnar compression
@@ -88,7 +94,15 @@ CREATE TABLE IF NOT EXISTS alerts (
 CREATE INDEX IF NOT EXISTS idx_alerts_patient_time
     ON alerts (patient_id, time DESC);
 
+-- -----------------------------------------------------------------------------
 -- Read-only role for Grafana
+--
+-- Crucial: a hypertable's chunks live in the `_timescaledb_internal` schema,
+-- NOT `public`. A reader needs SELECT on those chunks too — both existing
+-- chunks AND future ones (every new day creates new chunks). Without the
+-- ALTER DEFAULT PRIVILEGES lines below, the dashboard works at install time
+-- and silently breaks the next day.
+-- -----------------------------------------------------------------------------
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'grafana_ro') THEN
@@ -96,8 +110,19 @@ BEGIN
     END IF;
 END
 $$;
+
 GRANT CONNECT ON DATABASE clinical TO grafana_ro;
-GRANT USAGE ON SCHEMA public TO grafana_ro;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO grafana_ro;
+
+GRANT USAGE  ON SCHEMA public TO grafana_ro;
+GRANT SELECT ON ALL TABLES    IN SCHEMA public TO grafana_ro;
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO grafana_ro;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT ON TABLES    TO grafana_ro;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT ON SEQUENCES TO grafana_ro;
+
+-- TimescaleDB chunks
+GRANT USAGE  ON SCHEMA _timescaledb_internal TO grafana_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA _timescaledb_internal TO grafana_ro;
+ALTER DEFAULT PRIVILEGES IN SCHEMA _timescaledb_internal
     GRANT SELECT ON TABLES TO grafana_ro;
