@@ -483,7 +483,3 @@ clinical-telemetry-platform/
 - **Kubernetes deployment.** Helm charts per service, kube-prometheus-stack, custom HPA metric on `kafka_consumergroup_lag`.
 - **Chaos engineering.** Chaos Mesh `PodChaos` and `NetworkChaos` against the detector and worker; verify p99 latency under failure.
 - **Production hardening.** At-rest encryption, TLS on Kafka, audit logging, PHI de-identification at the ingest boundary.
-
-## License
-
-MIT. Portfolio project. Not in clinical use. Synthetic data only.
